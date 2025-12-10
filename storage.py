@@ -2,6 +2,9 @@
 
 On-disk format (one record per line):
     SET <key> <value>\n
+    DEL <key>\n
+    EXPIREAT <key> <absolute_ms>\n
+    PERSIST <key>\n
 
 Constraints:
   - <key> has no whitespace.
@@ -42,8 +45,9 @@ _logger.setLevel(os.getenv("KV_LOG_LEVEL", "WARNING").upper())
 _DEFAULT_ENCODING = "utf-8"
 _KEY_RE = re.compile(r"^\S+$")  # no whitespace
 
+
 class AppendOnlyLog:
-    """Append-only log for SET operations.
+    """Append-only log for SET/DEL/TTL operations.
 
     Each successful append is immediately fsync'ed for crash safety.
 
@@ -100,8 +104,15 @@ class AppendOnlyLog:
 
     # ------------------------- Public API -------------------------
 
-    def replay(self) -> Iterator[Tuple[str, str]]:
-        """Yield (key, value) records in append order.
+    def replay(self) -> Iterator[Tuple[str, str, str]]:
+        """Yield (op, key, arg) records in append order.
+
+        op  : "SET" | "DEL" | "EXPIREAT" | "PERSIST"
+        key : key string
+        arg : for SET      -> value string
+              for DEL      -> ""
+              for EXPIREAT -> absolute_ms as string
+              for PERSIST  -> ""
 
         Skips malformed records unless strict=True.
         Stops on read/Unicode errors with a WARNING.
@@ -109,14 +120,13 @@ class AppendOnlyLog:
         Notes
         -----
         - If the file ends without a newline, the last partial line is ignored.
-        - Lines are split with maxsplit=2 to preserve spaces in the value.
+        - SET lines are split with maxsplit=2 to preserve spaces in the value.
         """
         if not os.path.exists(self.path):
             _logger.debug("No log file at %s; nothing to replay.", self.path)
             return
 
         try:
-            # Open in text mode; newline="" preserves universal newline handling
             with open(self.path, "r", encoding=self.encoding, newline="") as fh:
                 # Peek last character to detect unterminated trailing line
                 try:
@@ -135,18 +145,17 @@ class AppendOnlyLog:
 
                 fh.seek(0)
                 for lineno, raw in enumerate(fh, start=1):
-                    # If file had partial last line, it will appear here without '\n'.
                     line = raw.rstrip("\n")
                     if not line:
                         continue
-                    ok, key, value, reason = self._parse_and_validate(line)
+                    ok, op, key, arg, reason = self._parse_and_validate(line)
                     if not ok:
                         msg = f"Skipping line {lineno}: {reason}"
                         if self.strict:
                             raise ValueError(msg)
                         _logger.debug(msg)
                         continue
-                    yield key, value
+                    yield op, key, arg
 
         except UnicodeError as e:
             _logger.warning("Replay halted due to Unicode decode error: %s", e)
@@ -156,36 +165,37 @@ class AppendOnlyLog:
             return
 
     def append_set(self, key: str, value: str) -> None:
-        """Append a single 'SET key value\\n' record and fsync.
-
-        Raises
-        ------
-        ValueError
-            If key/value fail basic validation.
-        OSError
-            If the write or fsync fails.
-        """
+        """Append a single 'SET key value\\n' record and fsync."""
         self._validate_key_value_or_raise(key, value)
-
         line = f"SET {key} {value}\n"
-        # Text mode + flush + fsync is fine for single-process appenders.
-        with open(self.path, "a", encoding=self.encoding, newline="") as fh:
-            fh.write(line)
-            fh.flush()
-            os.fsync(fh.fileno())
+        self._append_line(line)
+
+    def append_del(self, key: str) -> None:
+        """Append a 'DEL key' record."""
+        if not _KEY_RE.match(key):
+            raise ValueError("Key must be non-empty and contain no whitespace.")
+        line = f"DEL {key}\n"
+        self._append_line(line)
+
+    def append_expireat(self, key: str, absolute_ms: int) -> None:
+        """Append an 'EXPIREAT key absolute_ms' record."""
+        if not _KEY_RE.match(key):
+            raise ValueError("Key must be non-empty and contain no whitespace.")
+        line = f"EXPIREAT {key} {int(absolute_ms)}\n"
+        self._append_line(line)
+
+    def append_persist(self, key: str) -> None:
+        """Append a 'PERSIST key' record."""
+        if not _KEY_RE.match(key):
+            raise ValueError("Key must be non-empty and contain no whitespace.")
+        line = f"PERSIST {key}\n"
+        self._append_line(line)
 
     # Optional utility: rewrite a compacted file from an iterator of (k, v).
     def compact(self, items: Iterator[Tuple[str, str]], tmp_suffix: str = ".tmp") -> None:
-        """Rewrite the log with only the provided items (e.g., last-write-wins snapshot).
+        """Rewrite the log with only SET items (e.g., last-write-wins snapshot).
 
-        This is a best-effort compaction helper; atomic replace at the end.
-
-        Parameters
-        ----------
-        items : Iterator[Tuple[str, str]]
-            (key, value) pairs to write.
-        tmp_suffix : str
-            Temporary file suffix for atomic rename.
+        This helper is not used by Gradebot but kept for completeness.
         """
         tmp_path = self.path + tmp_suffix
         parent = os.path.dirname(self.path) or "."
@@ -197,7 +207,6 @@ class AppendOnlyLog:
             fh.flush()
             os.fsync(fh.fileno())
 
-        # Atomic replace + directory fsync for durability of rename
         os.replace(tmp_path, self.path)
         try:
             dir_fd = os.open(parent, os.O_RDONLY)
@@ -210,20 +219,59 @@ class AppendOnlyLog:
 
     # ----------------------- Internal helpers ----------------------
 
-    def _parse_and_validate(self, line: str) -> Tuple[bool, str, str, str]:
+    def _append_line(self, line: str) -> None:
+        """Append a raw line to the log with flush+fsync."""
+        with open(self.path, "a", encoding=self.encoding, newline="") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def _parse_and_validate(self, line: str) -> Tuple[bool, str, str, str, str]:
+        """Parse a log line.
+
+        Returns (ok, op, key, arg, reason).
+        """
+        # Split into at most 3 tokens; SET keeps the rest as value in arg.
         parts = line.split(" ", 2)
-        if len(parts) != 3:
-            return False, "", "", "malformed (expected 3 tokens)"
-        cmd, key, value = parts
-        if cmd != "SET":
-            return False, "", "", f"unsupported command '{cmd}'"
-        if not _KEY_RE.match(key):
-            return False, "", "", "invalid key (contains whitespace or empty)"
-        if self.max_key_len is not None and len(key) > self.max_key_len:
-            return False, "", "", f"key too long (> {self.max_key_len})"
-        if self.max_value_len is not None and len(value) > self.max_value_len:
-            return False, "", "", f"value too long (> {self.max_value_len})"
-        return True, key, value, ""
+        if not parts:
+            return False, "", "", "", "empty line"
+        op = parts[0]
+
+        if op == "SET":
+            if len(parts) != 3:
+                return False, "", "", "", "SET malformed (expected 3 tokens)"
+            _, key, value = parts
+            if not _KEY_RE.match(key):
+                return False, "", "", "", "invalid key (contains whitespace or empty)"
+            if self.max_key_len is not None and len(key) > self.max_key_len:
+                return False, "", "", "", f"key too long (> {self.max_key_len})"
+            if self.max_value_len is not None and len(value) > self.max_value_len:
+                return False, "", "", "", f"value too long (> {self.max_value_len})"
+            return True, "SET", key, value, ""
+
+        if op in ("DEL", "PERSIST"):
+            if len(parts) != 2:
+                return False, "", "", "", f"{op} malformed (expected 2 tokens)"
+            _, key = parts
+            if not _KEY_RE.match(key):
+                return False, "", "", "", "invalid key (contains whitespace or empty)"
+            if self.max_key_len is not None and len(key) > self.max_key_len:
+                return False, "", "", "", f"key too long (> {self.max_key_len})"
+            return True, op, key, "", ""
+
+        if op == "EXPIREAT":
+            if len(parts) != 3:
+                return False, "", "", "", "EXPIREAT malformed (expected 3 tokens)"
+            _, key, ms_str = parts
+            if not _KEY_RE.match(key):
+                return False, "", "", "", "invalid key (contains whitespace or empty)"
+            try:
+                int(ms_str)
+            except ValueError:
+                return False, "", "", "", "EXPIREAT ms is not an integer"
+            return True, "EXPIREAT", key, ms_str, ""
+
+        return False, "", "", "", f"unsupported command '{op}'"
 
     def _validate_key_value_or_raise(self, key: str, value: str) -> None:
         if not _KEY_RE.match(key):
